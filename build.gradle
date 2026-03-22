@@ -5,12 +5,42 @@ plugins {
 
 java {
     toolchain {
-        languageVersion = JavaLanguageVersion.of(21)
+        languageVersion = JavaLanguageVersion.of(17)
     }
 }
 
 application {
     mainClass = 'com.mapgrow.MapGrowApp'
+}
+
+tasks.register('buildGeoJson', JavaExec) {
+    description = 'Download country boundaries from geoBoundaries and build countries.geojson'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.mapgrow.tools.BuildGeoJson'
+}
+
+tasks.register('buildEezZones', JavaExec) {
+    description = 'Download EEZ+Land zones from Marine Regions for country lookup'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.mapgrow.tools.BuildEezZones'
+}
+
+tasks.register('computeColors', JavaExec) {
+    description = 'Compute graph coloring for countries and write country_colors.properties'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.mapgrow.tools.ComputeColors'
+}
+
+tasks.register('fatJar', Jar) {
+    archiveClassifier = 'all'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes 'Main-Class': 'com.mapgrow.MapGrowApp'
+    }
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+    with jar
 }
 
 repositories {

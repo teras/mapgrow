@@ -28,6 +28,8 @@ public class MapGrowApp extends JFrame {
         controlPanel.addStartListener(e -> startProcessing());
         controlPanel.addStopListener(e -> stopProcessing());
         controlPanel.addResetListener(e -> resetView());
+        controlPanel.addViewModeListener(mapPanel::setViewMode);
+        mapPanel.setZoomChangeListener(() -> controlPanel.setZoom(mapPanel.getZoom()));
 
         setLayout(new BorderLayout());
         add(mapPanel, BorderLayout.CENTER);

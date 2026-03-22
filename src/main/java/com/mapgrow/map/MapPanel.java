@@ -1,6 +1,7 @@
 package com.mapgrow.map;
 
 import com.mapgrow.geo.CountryStore;
+import com.mapgrow.processing.Rasterizer;
 
 import javax.imageio.ImageIO;
 import javax.swing.*;
@@ -20,37 +21,55 @@ import java.util.concurrent.Executors;
 public class MapPanel extends JPanel {
 
     private static final int TILE_SIZE = 256;
+    private static final int TILE_PIXELS = TILE_SIZE * TILE_SIZE;
     private static final int MIN_ZOOM = 2;
     private static final int MAX_ZOOM = 17;
     private static final String OSM_URL = "https://tile.openstreetmap.org/%d/%d/%d.png";
     private static final String CARTO_URL = "https://basemaps.cartocdn.com/light_nolabels/%d/%d/%d.png";
 
-    // CartoDB water color
+    // CartoDB water color (212, 218, 220) — blue-shifted gray
     private static final int WATER_R = 212, WATER_G = 218, WATER_B = 220;
-    private static final int WATER_TOLERANCE = 20;
+    private static final int WATER_DIST_THRESHOLD = 625; // squared distance ~25²
+    private static final int BLUE_TINT_MIN = 3; // min B-R difference to be considered water
+
+    private static final float OVERLAY_ALPHA = 0.6f;
+    private static final Color BG_MAP = new Color(170, 211, 223);
+    private static final Color BG_TILE_LOADING = new Color(200, 220, 230);
+
+    // Nearest country cache: 4x4 pixel blocks → 64x64 grid per tile
+    private static final int CACHE_BLOCK = 4;
+    private static final int CACHE_GRID = TILE_SIZE / CACHE_BLOCK; // 64
+
+    private static final int[] DX_8 = {-1, 0, 1, -1, 1, -1, 0, 1};
+    private static final int[] DY_8 = {-1, -1, -1, 0, 0, 1, 1, 1};
+
+    public enum ViewMode { MAP_WITH_OVERLAY, LAND_SEA, LAND_SEA_COLORED, NATURAL_EARTH }
+
+    private record TileData(BufferedImage overlay, BufferedImage landMask, BufferedImage naturalEarth) {}
 
     private double centerX, centerY;
     private int zoom = 6;
+    private ViewMode viewMode = ViewMode.MAP_WITH_OVERLAY;
 
     private final ConcurrentHashMap<String, BufferedImage> osmCache = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, BufferedImage> overlayTileCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, TileData> tileDataCache = new ConcurrentHashMap<>();
     private final ExecutorService tileLoader = Executors.newFixedThreadPool(6);
     private final HttpClient httpClient = HttpClient.newBuilder()
             .followRedirects(HttpClient.Redirect.NORMAL)
             .build();
+    private final Rasterizer rasterizer = new Rasterizer();
 
     private CountryStore countryStore;
 
     private Point dragStart;
     private double dragCenterX, dragCenterY;
     private boolean interactionEnabled = true;
+    private Runnable zoomChangeListener;
 
-    // Full-viewport overlay for sea expansion (set during processing)
     private volatile BufferedImage expansionOverlay;
-    private float overlayAlpha = 0.6f;
 
     public MapPanel() {
-        setBackground(new Color(170, 211, 223));
+        setBackground(BG_MAP);
         setCenter(38.0, 24.0, zoom);
 
         MouseAdapter mouseHandler = new MouseAdapter() {
@@ -74,8 +93,7 @@ public class MapPanel extends JPanel {
             public void mouseWheelMoved(MouseWheelEvent e) {
                 if (!interactionEnabled) return;
                 int oldZoom = zoom;
-                int newZoom = zoom - e.getWheelRotation();
-                newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
+                int newZoom = clamp(zoom - e.getWheelRotation(), MIN_ZOOM, MAX_ZOOM);
                 if (newZoom != oldZoom) {
                     int mx = e.getX() - getWidth() / 2;
                     int my = e.getY() - getHeight() / 2;
@@ -85,6 +103,7 @@ public class MapPanel extends JPanel {
                     centerX = worldX * scale - mx;
                     centerY = worldY * scale - my;
                     zoom = newZoom;
+                    if (zoomChangeListener != null) zoomChangeListener.run();
                     repaint();
                 }
             }
@@ -100,6 +119,12 @@ public class MapPanel extends JPanel {
         repaint();
     }
 
+    public int getZoom() { return zoom; }
+
+    public void setZoomChangeListener(Runnable listener) {
+        this.zoomChangeListener = listener;
+    }
+
     public void setInteractionEnabled(boolean enabled) {
         this.interactionEnabled = enabled;
         setCursor(Cursor.getPredefinedCursor(enabled ? Cursor.MOVE_CURSOR : Cursor.WAIT_CURSOR));
@@ -112,6 +137,12 @@ public class MapPanel extends JPanel {
 
     public void clearExpansionOverlay() {
         this.expansionOverlay = null;
+        repaint();
+    }
+
+    public void setViewMode(ViewMode mode) {
+        this.viewMode = mode;
+        setBackground(mode == ViewMode.MAP_WITH_OVERLAY ? BG_MAP : Color.WHITE);
         repaint();
     }
 
@@ -132,6 +163,7 @@ public class MapPanel extends JPanel {
         int tileYEnd = (int) Math.floor((originY + h) / TILE_SIZE);
 
         Composite originalComposite = g2.getComposite();
+        boolean showOsm = viewMode == ViewMode.MAP_WITH_OVERLAY;
 
         for (int ty = tileYStart; ty <= tileYEnd; ty++) {
             for (int tx = tileXStart; tx <= tileXEnd; tx++) {
@@ -141,41 +173,44 @@ public class MapPanel extends JPanel {
                 int screenX = (int) (tx * TILE_SIZE - originX);
                 int screenY = (int) (ty * TILE_SIZE - originY);
 
-                // Draw OSM tile
-                BufferedImage osmTile = getOsmTile(zoom, wrappedTx, ty);
-                if (osmTile != null) {
-                    g2.drawImage(osmTile, screenX, screenY, TILE_SIZE, TILE_SIZE, null);
-                } else {
-                    g2.setColor(new Color(200, 220, 230));
-                    g2.fillRect(screenX, screenY, TILE_SIZE, TILE_SIZE);
+                if (showOsm) {
+                    BufferedImage osmTile = getOsmTile(zoom, wrappedTx, ty);
+                    if (osmTile != null) {
+                        g2.drawImage(osmTile, screenX, screenY, TILE_SIZE, TILE_SIZE, null);
+                    } else {
+                        g2.setColor(BG_TILE_LOADING);
+                        g2.fillRect(screenX, screenY, TILE_SIZE, TILE_SIZE);
+                    }
                 }
 
-                // Draw country overlay tile (if no expansion overlay active)
                 if (expansionOverlay == null) {
-                    BufferedImage overlayTile = getOverlayTile(zoom, wrappedTx, ty);
-                    if (overlayTile != null) {
-                        g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, overlayAlpha));
-                        g2.drawImage(overlayTile, screenX, screenY, TILE_SIZE, TILE_SIZE, null);
-                        g2.setComposite(originalComposite);
+                    TileData td = getTileData(zoom, wrappedTx, ty);
+                    if (td != null) {
+                        BufferedImage img = switch (viewMode) {
+                            case MAP_WITH_OVERLAY, LAND_SEA_COLORED -> td.overlay;
+                            case LAND_SEA -> td.landMask;
+                            case NATURAL_EARTH -> td.naturalEarth;
+                        };
+                        if (showOsm) {
+                            g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, OVERLAY_ALPHA));
+                        }
+                        g2.drawImage(img, screenX, screenY, TILE_SIZE, TILE_SIZE, null);
+                        if (showOsm) {
+                            g2.setComposite(originalComposite);
+                        }
                     }
                 }
             }
         }
 
-        // Draw expansion overlay (during/after processing)
+        // Expansion overlay (during/after processing)
         BufferedImage expOverlay = this.expansionOverlay;
         if (expOverlay != null) {
-            g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, overlayAlpha));
+            g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, OVERLAY_ALPHA));
             g2.drawImage(expOverlay, 0, 0, w, h, null);
             g2.setComposite(originalComposite);
         }
 
-        // Crosshair
-        if (expansionOverlay == null) {
-            g2.setColor(new Color(0, 0, 0, 80));
-            g2.drawLine(w / 2 - 10, h / 2, w / 2 + 10, h / 2);
-            g2.drawLine(w / 2, h / 2 - 10, w / 2, h / 2 + 10);
-        }
     }
 
     private BufferedImage getOsmTile(int z, int x, int y) {
@@ -194,69 +229,67 @@ public class MapPanel extends JPanel {
         return null;
     }
 
-    private BufferedImage getOverlayTile(int z, int x, int y) {
+    private TileData getTileData(int z, int x, int y) {
         if (countryStore == null) return null;
 
         String key = z + "/" + x + "/" + y;
-        BufferedImage cached = overlayTileCache.get(key);
+        TileData cached = tileDataCache.get(key);
         if (cached != null) return cached;
 
         tileLoader.submit(() -> {
-            if (overlayTileCache.containsKey(key)) return;
+            if (tileDataCache.containsKey(key)) return;
 
-            // Fetch CartoDB clean tile
             BufferedImage cartoTile = fetchTile(String.format(CARTO_URL, z, x, y));
             if (cartoTile == null) return;
 
-            // Build water mask from CartoDB tile
-            boolean[] isLand = new boolean[TILE_SIZE * TILE_SIZE];
-            BufferedImage rgba = new BufferedImage(TILE_SIZE, TILE_SIZE, BufferedImage.TYPE_INT_ARGB);
-            Graphics2D gTemp = rgba.createGraphics();
+            // Convert to ARGB and get backing array for fast pixel access
+            BufferedImage cartoArgb = new BufferedImage(TILE_SIZE, TILE_SIZE, BufferedImage.TYPE_INT_ARGB);
+            Graphics2D gTemp = cartoArgb.createGraphics();
             gTemp.drawImage(cartoTile, 0, 0, null);
             gTemp.dispose();
+            int[] cartoPixels = ((DataBufferInt) cartoArgb.getRaster().getDataBuffer()).getData();
 
-            // Compute distance from water color for each pixel,
-            // then threshold at midpoint between water and land colors.
-            // Water color ≈ (212,218,220), land ≈ (250,250,248).
-            // Midpoint distance ≈ 25. Anything closer to water = water.
-            int[] dist = new int[TILE_SIZE * TILE_SIZE];
-            for (int py = 0; py < TILE_SIZE; py++) {
-                for (int px = 0; px < TILE_SIZE; px++) {
-                    int rgb = rgba.getRGB(px, py);
-                    int r = (rgb >> 16) & 0xFF;
-                    int g = (rgb >> 8) & 0xFF;
-                    int b = rgb & 0xFF;
-                    int dr = r - WATER_R, dg = g - WATER_G, db = b - WATER_B;
-                    dist[py * TILE_SIZE + px] = dr * dr + dg * dg + db * db;
-                }
+            // Classify land/water: water must be close to water color AND blue-tinted
+            boolean[] isLand = new boolean[TILE_PIXELS];
+            for (int i = 0; i < TILE_PIXELS; i++) {
+                int rgb = cartoPixels[i];
+                int r = (rgb >> 16) & 0xFF;
+                int g = (rgb >> 8) & 0xFF;
+                int b = rgb & 0xFF;
+                int dr = r - WATER_R, dg = g - WATER_G, db = b - WATER_B;
+                int distSq = dr * dr + dg * dg + db * db;
+                isLand[i] = distSq > WATER_DIST_THRESHOLD || b <= r + BLUE_TINT_MIN;
             }
 
-            // Threshold: squared distance. Water=(212,218,220), Land≈(250,250,248)
-            // Midpoint squared distance ≈ 25² = 625
-            int threshold = 625;
-            for (int i = 0; i < TILE_SIZE * TILE_SIZE; i++) {
-                isLand[i] = dist[i] > threshold;
-            }
-
-            // Rasterize countries onto this tile
+            // Rasterize countries
             double tileMinLon = tileToLon(x, z);
             double tileMaxLon = tileToLon(x + 1, z);
             double tileMinLat = tileToLat(y + 1, z);
             double tileMaxLat = tileToLat(y, z);
 
             var countries = countryStore.getCountriesIn(tileMinLon, tileMinLat, tileMaxLon, tileMaxLat);
-
-            com.mapgrow.processing.Rasterizer rasterizer = new com.mapgrow.processing.Rasterizer();
             int[] countryPixels = rasterizer.rasterize(
                     tileMinLon, tileMinLat, tileMaxLon, tileMaxLat,
                     TILE_SIZE, TILE_SIZE, countries);
 
-            // Combine: CartoDB determines land/sea, GeoJSON determines country color
+            // Land mask (black land on transparent)
+            BufferedImage landMask = new BufferedImage(TILE_SIZE, TILE_SIZE, BufferedImage.TYPE_INT_ARGB);
+            int[] landMaskPixels = ((DataBufferInt) landMask.getRaster().getDataBuffer()).getData();
+            for (int i = 0; i < TILE_PIXELS; i++) {
+                if (isLand[i]) landMaskPixels[i] = 0xFF000000;
+            }
+
+            // Natural Earth (raw country polygons, no CartoDB masking)
+            BufferedImage naturalEarth = new BufferedImage(TILE_SIZE, TILE_SIZE, BufferedImage.TYPE_INT_ARGB);
+            int[] nePixels = ((DataBufferInt) naturalEarth.getRaster().getDataBuffer()).getData();
+            System.arraycopy(countryPixels, 0, nePixels, 0, TILE_PIXELS);
+
+            // Overlay (CartoDB land + country colors + fill)
             BufferedImage overlay = new BufferedImage(TILE_SIZE, TILE_SIZE, BufferedImage.TYPE_INT_ARGB);
             int[] overlayData = ((DataBufferInt) overlay.getRaster().getDataBuffer()).getData();
 
             int uncoloredLand = 0;
-            for (int i = 0; i < TILE_SIZE * TILE_SIZE; i++) {
+            for (int i = 0; i < TILE_PIXELS; i++) {
                 if (isLand[i] && countryPixels[i] != 0) {
                     overlayData[i] = countryPixels[i];
                 } else if (isLand[i]) {
@@ -264,61 +297,20 @@ public class MapPanel extends JPanel {
                 }
             }
 
-            // Second pass: expand country colors to fill uncolored land pixels
             if (uncoloredLand > 0) {
                 fillUncoloredLand(overlayData, isLand, TILE_SIZE, TILE_SIZE);
-
-                // Third pass: if still uncolored land (isolated islands with no country polygon),
-                // find nearest country geographically
-                boolean stillUncolored = false;
-                for (int i = 0; i < TILE_SIZE * TILE_SIZE; i++) {
-                    if (isLand[i] && overlayData[i] == 0) {
-                        stillUncolored = true;
-                        break;
-                    }
-                }
-
-                if (stillUncolored) {
-                    // Per-pixel nearest country lookup for each uncolored land pixel
-                    // Cache results: same country within a tile is likely reused
-                    java.util.Map<String, Integer> countryColorCache = new java.util.HashMap<>();
-
-                    for (int i = 0; i < TILE_SIZE * TILE_SIZE; i++) {
-                        if (isLand[i] && overlayData[i] == 0) {
-                            int px = i % TILE_SIZE, py = i / TILE_SIZE;
-                            double lon = tileMinLon + ((px + 0.5) / TILE_SIZE) * (tileMaxLon - tileMinLon);
-                            double lat = tileMaxLat - ((py + 0.5) / TILE_SIZE) * (tileMaxLat - tileMinLat);
-
-                            // Quantize to reduce lookups (group pixels in ~4x4 blocks)
-                            String cacheKey = (px / 4) + "," + (py / 4);
-                            Integer cachedColor = countryColorCache.get(cacheKey);
-                            if (cachedColor != null) {
-                                overlayData[i] = cachedColor;
-                            } else {
-                                var nearest = countryStore.getNearestCountry(lon, lat);
-                                if (nearest != null) {
-                                    int color = nearest.color().getRGB();
-                                    overlayData[i] = color;
-                                    countryColorCache.put(cacheKey, color);
-                                }
-                            }
-                        }
-                    }
-                }
+                fillIsolatedLand(overlayData, isLand, tileMinLon, tileMaxLon, tileMinLat, tileMaxLat);
             }
 
-            overlayTileCache.put(key, overlay);
+            tileDataCache.put(key, new TileData(overlay, landMask, naturalEarth));
             SwingUtilities.invokeLater(this::repaint);
         });
         return null;
     }
 
     /**
-     * Expand country colors to fill ALL uncolored land pixels within a tile.
-     * Two phases:
-     * 1) Frontier expansion from colored land to adjacent uncolored land
-     * 2) For isolated land clusters (no country polygon at all), find nearest
-     *    colored pixel on the tile and assign that color
+     * Fills uncolored land pixels that are adjacent to colored pixels
+     * via frontier expansion (flood fill through connected land).
      */
     private static void fillUncoloredLand(int[] pixels, boolean[] isLand, int w, int h) {
         int size = w * h;
@@ -327,15 +319,13 @@ public class MapPanel extends JPanel {
         boolean[] inFrontier = new boolean[size];
         int frontierSize = 0;
 
-        // Find uncolored land adjacent to ANY colored pixel (land or already-filled)
         for (int i = 0; i < size; i++) {
             if (isLand[i] && pixels[i] == 0) {
                 int x = i % w, y = i / w;
                 for (int d = 0; d < 8; d++) {
                     int nx = x + DX_8[d], ny = y + DY_8[d];
                     if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-                        int ni = ny * w + nx;
-                        if (pixels[ni] != 0) {
+                        if (pixels[ny * w + nx] != 0) {
                             curFrontier[frontierSize++] = i;
                             inFrontier[i] = true;
                             break;
@@ -345,9 +335,7 @@ public class MapPanel extends JPanel {
             }
         }
 
-        // Phase 1: expand from colored neighbors
         while (frontierSize > 0) {
-            // Color all frontier pixels
             for (int f = 0; f < frontierSize; f++) {
                 int idx = curFrontier[f];
                 int x = idx % w, y = idx / w;
@@ -363,7 +351,6 @@ public class MapPanel extends JPanel {
                 }
             }
 
-            // Build next frontier (separate array to avoid overwrite bug)
             int nextSize = 0;
             java.util.Arrays.fill(inFrontier, false);
             for (int f = 0; f < frontierSize; f++) {
@@ -381,73 +368,51 @@ public class MapPanel extends JPanel {
                 }
             }
 
-            // Swap
             int[] tmp = curFrontier;
             curFrontier = nextFrontier;
             nextFrontier = tmp;
             frontierSize = nextSize;
         }
+    }
 
-        // Phase 2: handle isolated land with no country polygon at all
-        // Find nearest colored pixel for each remaining uncolored land pixel
-        boolean hasUncolored = false;
-        for (int i = 0; i < size; i++) {
-            if (isLand[i] && pixels[i] == 0) {
-                hasUncolored = true;
+    /**
+     * Fills isolated land pixels (no adjacent colored land) using
+     * getNearestCountry() for correct geographic assignment.
+     * Uses a flat int[] cache indexed by 4x4 pixel blocks.
+     */
+    private void fillIsolatedLand(int[] overlayData, boolean[] isLand,
+                                   double minLon, double maxLon, double minLat, double maxLat) {
+        boolean stillUncolored = false;
+        for (int i = 0; i < TILE_PIXELS; i++) {
+            if (isLand[i] && overlayData[i] == 0) {
+                stillUncolored = true;
                 break;
             }
         }
+        if (!stillUncolored) return;
 
-        if (hasUncolored) {
-            // BFS from ALL colored pixels simultaneously to find nearest color for each uncolored
-            java.util.Arrays.fill(inFrontier, false);
-            frontierSize = 0;
-            for (int i = 0; i < size; i++) {
-                if (pixels[i] != 0) {
-                    curFrontier[frontierSize++] = i;
-                    inFrontier[i] = true;
-                }
-            }
+        int[] colorCache = new int[CACHE_GRID * CACHE_GRID];
+        boolean[] cacheValid = new boolean[CACHE_GRID * CACHE_GRID];
 
-            // nearestColor[i] = color of nearest colored pixel
-            int[] nearestColor = new int[size];
-            System.arraycopy(pixels, 0, nearestColor, 0, size);
+        for (int i = 0; i < TILE_PIXELS; i++) {
+            if (!isLand[i] || overlayData[i] != 0) continue;
 
-            while (frontierSize > 0) {
-                int nextSize = 0;
-                for (int f = 0; f < frontierSize; f++) {
-                    int idx = curFrontier[f];
-                    int x = idx % w, y = idx / w;
-                    int color = nearestColor[idx];
-                    for (int d = 0; d < 8; d++) {
-                        int nx = x + DX_8[d], ny = y + DY_8[d];
-                        if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-                            int ni = ny * w + nx;
-                            if (!inFrontier[ni]) {
-                                nearestColor[ni] = color;
-                                inFrontier[ni] = true;
-                                nextFrontier[nextSize++] = ni;
-                            }
-                        }
-                    }
-                }
-                int[] tmp = curFrontier;
-                curFrontier = nextFrontier;
-                nextFrontier = tmp;
-                frontierSize = nextSize;
-            }
+            int px = i % TILE_SIZE, py = i / TILE_SIZE;
+            int cacheIdx = (px / CACHE_BLOCK) * CACHE_GRID + (py / CACHE_BLOCK);
 
-            // Apply to uncolored land
-            for (int i = 0; i < size; i++) {
-                if (isLand[i] && pixels[i] == 0 && nearestColor[i] != 0) {
-                    pixels[i] = nearestColor[i];
-                }
+            if (cacheValid[cacheIdx]) {
+                overlayData[i] = colorCache[cacheIdx];
+            } else {
+                double lon = minLon + ((px + 0.5) / TILE_SIZE) * (maxLon - minLon);
+                double lat = maxLat - ((py + 0.5) / TILE_SIZE) * (maxLat - minLat);
+                var nearest = countryStore.getNearestCountry(lon, lat);
+                int color = nearest != null ? nearest.color().getRGB() : 0;
+                overlayData[i] = color;
+                colorCache[cacheIdx] = color;
+                cacheValid[cacheIdx] = true;
             }
         }
     }
-
-    private static final int[] DX_8 = {-1, 0, 1, -1, 1, -1, 0, 1};
-    private static final int[] DY_8 = {-1, -1, -1, 0, 0, 1, 1, 1};
 
     private BufferedImage fetchTile(String url) {
         try {
@@ -462,7 +427,7 @@ public class MapPanel extends JPanel {
                 return ImageIO.read(response.body());
             }
         } catch (Exception e) {
-            // Silently ignore
+            // Silently ignore network errors
         }
         return null;
     }
@@ -487,20 +452,20 @@ public class MapPanel extends JPanel {
                 int wrappedTx = ((tx % maxTile) + maxTile) % maxTile;
                 if (ty < 0 || ty >= maxTile) continue;
 
-                String key = zoom + "/" + wrappedTx + "/" + ty;
-                BufferedImage overlayTile = overlayTileCache.get(key);
-                if (overlayTile == null) continue;
+                TileData td = tileDataCache.get(zoom + "/" + wrappedTx + "/" + ty);
+                if (td == null) continue;
 
                 int tileScreenX = (int) (tx * TILE_SIZE - originX);
                 int tileScreenY = (int) (ty * TILE_SIZE - originY);
+                int[] tilePixels = ((DataBufferInt) td.overlay.getRaster().getDataBuffer()).getData();
 
-                int[] tileData = ((DataBufferInt) overlayTile.getRaster().getDataBuffer()).getData();
                 for (int py = 0; py < TILE_SIZE; py++) {
+                    int sy = tileScreenY + py;
+                    if (sy < 0 || sy >= height) continue;
                     for (int px = 0; px < TILE_SIZE; px++) {
                         int sx = tileScreenX + px;
-                        int sy = tileScreenY + py;
-                        if (sx >= 0 && sx < width && sy >= 0 && sy < height) {
-                            int color = tileData[py * TILE_SIZE + px];
+                        if (sx >= 0 && sx < width) {
+                            int color = tilePixels[py * TILE_SIZE + px];
                             if (color != 0) {
                                 pixels[sy * width + sx] = color;
                             }
@@ -512,12 +477,6 @@ public class MapPanel extends JPanel {
         return pixels;
     }
 
-    public double[] getViewportBounds() {
-        int w = getWidth();
-        int h = getHeight();
-        return new double[]{w, h};
-    }
-
     private static double tileToLon(int x, int z) {
         return x / (double) (1 << z) * 360.0 - 180.0;
     }
@@ -527,15 +486,8 @@ public class MapPanel extends JPanel {
         return Math.toDegrees(Math.atan(Math.sinh(n)));
     }
 
-    private double worldXToLon(double worldX, int zoom) {
-        int mapSize = TILE_SIZE * (1 << zoom);
-        return worldX / mapSize * 360.0 - 180.0;
-    }
-
-    private double worldYToLat(double worldY, int zoom) {
-        int mapSize = TILE_SIZE * (1 << zoom);
-        double n = Math.PI - 2.0 * Math.PI * worldY / mapSize;
-        return Math.toDegrees(Math.atan(Math.sinh(n)));
+    private static int clamp(int val, int min, int max) {
+        return Math.max(min, Math.min(max, val));
     }
 
     private void setCenter(double lat, double lon, int zoom) {

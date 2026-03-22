@@ -46,7 +46,7 @@ public class ProcessingTask extends SwingWorker<Void, String> {
     @Override
     protected void process(List<String> chunks) {
         if (!chunks.isEmpty() && statusCallback != null) {
-            statusCallback.accept(chunks.getLast());
+            statusCallback.accept(chunks.get(chunks.size() - 1));
         }
     }
 }

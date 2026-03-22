@@ -9,6 +9,8 @@ import org.locationtech.jts.geom.MultiPolygon;
 import java.awt.*;
 import java.awt.geom.GeneralPath;
 import java.awt.image.BufferedImage;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
 public class Rasterizer {
@@ -29,7 +31,11 @@ public class Rasterizer {
         Graphics2D g = colorImage.createGraphics();
         g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
 
-        for (CountryInfo country : countries) {
+        // Draw largest countries first so smaller ones paint over overlaps
+        List<CountryInfo> sorted = new ArrayList<>(countries);
+        sorted.sort(Comparator.comparingDouble((CountryInfo c) -> c.geometry().getArea()).reversed());
+
+        for (CountryInfo country : sorted) {
             Shape shape = geometryToShape(country.geometry(), minLon, mercMinY, scaleX, scaleY);
             if (shape == null) continue;
             g.setColor(country.color());
