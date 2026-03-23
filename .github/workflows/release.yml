@@ -1,0 +1,193 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g. 1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Create GitHub Release
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes --draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    needs: create-release
+    if: always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos-arm64
+            java-arch: aarch64
+          - os: macos-latest
+            platform: macos-x64
+            java-arch: x64
+          - os: windows-latest
+            platform: windows
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          architecture: ${{ matrix.java-arch || '' }}
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Determine version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "APP_VERSION=${{ github.event.inputs.version }}" >> "$GITHUB_ENV"
+          else
+            echo "APP_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          fi
+
+      # Linux: .deb installer + tar.gz with wrapper script
+      - name: Build Linux packages
+        if: matrix.platform == 'linux'
+        run: |
+          gradle jpackage -PappVersion="${APP_VERSION}"
+          cp build/jpackage/*.deb /tmp/
+          gradle clean packageDist -PappVersion="${APP_VERSION}"
+          cp /tmp/*.deb build/distributions/
+
+      # macOS: build, sign, notarize, package
+      - name: Build and sign macOS app
+        if: startsWith(matrix.platform, 'macos')
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARY_KEY_JSON: ${{ secrets.APPLE_NOTARY_KEY_JSON }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          gradle jpackageImage -PappVersion="${APP_VERSION}"
+
+          APP_PATH="build/jpackage/MapGrow.app"
+          ENTITLEMENTS="src/main/packaging/macos-entitlements.plist"
+
+          # Import certificate into temporary keychain
+          KEYCHAIN_PWD=$(openssl rand -base64 32)
+          security create-keychain -p "$KEYCHAIN_PWD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PWD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > certificate.p12
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PWD" build.keychain
+          IDENTITY=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -1 | awk '{print $2}')
+          rm certificate.p12
+
+          # Strip quarantine attributes
+          xattr -cr "$APP_PATH"
+
+          # Sign all binaries inside the .app
+          find "$APP_PATH" -type f \( -name "*.dylib" -o -name "*.jnilib" -o -perm +111 \) \
+            -exec codesign --force --sign "$IDENTITY" --timestamp --options runtime \
+            --entitlements "$ENTITLEMENTS" {} \; || true
+
+          # Sign native libs inside JARs
+          find "$APP_PATH" -name "*.jar" -type f | while read -r jar_file; do
+            if unzip -l "$jar_file" 2>/dev/null | grep -q "\.dylib\|\.jnilib\|\.so$"; then
+              JAR_DIR=$(dirname "$jar_file")
+              JAR_TEMP=$(mktemp -d "$JAR_DIR/jar_tmp.XXXXXX")
+              unzip -q "$jar_file" -d "$JAR_TEMP"
+              find "$JAR_TEMP" -type f \( -name "*.dylib" -o -name "*.jnilib" -o -name "*.so" \) | while read -r lib_file; do
+                codesign --force --sign "$IDENTITY" --timestamp --options runtime \
+                  --entitlements "$ENTITLEMENTS" "$lib_file"
+              done
+              NEW_JAR="/tmp/signed_$(basename "$jar_file")"
+              (cd "$JAR_TEMP" && zip -qr "$NEW_JAR" .)
+              cp "$NEW_JAR" "$jar_file"
+              rm -f "$NEW_JAR"
+              rm -rf "$JAR_TEMP"
+            fi
+          done
+
+          # Sign the .app bundle
+          codesign --force --deep --sign "$IDENTITY" --timestamp --options runtime \
+            --entitlements "$ENTITLEMENTS" "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
+          # Parse notarization JSON and create .p8 key file
+          APPLE_API_ISSUER=$(echo "$APPLE_NOTARY_KEY_JSON" | grep -o '"issuer_id"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/')
+          APPLE_API_KEY_ID=$(echo "$APPLE_NOTARY_KEY_JSON" | grep -o '"key_id"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/')
+          APPLE_API_KEY=$(echo "$APPLE_NOTARY_KEY_JSON" | grep -o '"private_key"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/')
+
+          mkdir -p ~/private_keys
+          echo "-----BEGIN PRIVATE KEY-----" > ~/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8
+          echo "$APPLE_API_KEY" >> ~/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8
+          echo "-----END PRIVATE KEY-----" >> ~/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8
+          chmod 600 ~/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8
+
+          # Create ZIP (used for both notarization and distribution)
+          ARCH_SUFFIX=$([[ "${{ matrix.platform }}" == "macos-arm64" ]] && echo "arm64" || echo "x64")
+          DIST_ZIP="build/distributions/mapgrow-${APP_VERSION}-macos-${ARCH_SUFFIX}.zip"
+          mkdir -p build/distributions
+          ditto -c -k --keepParent "$APP_PATH" "$DIST_ZIP"
+
+          # Notarize
+          xcrun notarytool submit "$DIST_ZIP" \
+            --key ~/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8 \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+
+          # Staple and re-zip
+          xcrun stapler staple "$APP_PATH"
+          rm "$DIST_ZIP"
+          ditto -c -k --keepParent "$APP_PATH" "$DIST_ZIP"
+
+          rm -rf ~/private_keys
+
+      # Windows: ZIP with native .exe launcher
+      - name: Build Windows package
+        if: matrix.platform == 'windows'
+        shell: bash
+        run: gradle packageZip -PappVersion="${APP_VERSION}"
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(build/distributions/mapgrow-* build/distributions/*.deb)
+          for f in "${files[@]}"; do
+            echo "Uploading $f"
+            gh release upload "$GITHUB_REF_NAME" "$f" --repo "$GITHUB_REPOSITORY" --clobber
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Publish release
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

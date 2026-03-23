@@ -1,7 +1,10 @@
 plugins {
     id 'java'
     id 'application'
+    id 'org.beryx.runtime' version '2.0.1'
 }
+
+version = findProperty('appVersion') ?: '1.0.0'
 
 java {
     toolchain {
@@ -12,6 +15,71 @@ java {
 application {
     mainClass = 'com.mapgrow.MapGrowApp'
 }
+
+runtime {
+    options = ['--strip-debug', '--compress', '2', '--no-header-files', '--no-man-pages',
+               '--add-modules', 'jdk.crypto.ec']
+
+    jpackage {
+        def os = org.gradle.internal.os.OperatingSystem.current()
+        appVersion = project.version.toString()
+        imageName = 'MapGrow'
+        if (os.isLinux()) {
+            installerType = 'deb'
+            installerOptions += ['--linux-shortcut']
+        } else if (os.isMacOsX()) {
+            installerType = 'dmg'
+            installerOptions += ['--mac-package-name', 'MapGrow']
+        } else if (os.isWindows()) {
+            installerType = 'msi'
+            installerOptions += [
+                '--win-menu', '--win-shortcut',
+                '--win-dir-chooser', '--win-menu-group', 'MapGrow'
+            ]
+        }
+    }
+}
+
+tasks.register('packageDist', Tar) {
+    dependsOn 'runtime'
+    description = 'Create a tar.gz distribution with embedded JRE (Linux/macOS)'
+    archiveBaseName = 'mapgrow'
+    archiveClassifier = org.gradle.internal.os.OperatingSystem.current().with {
+        isLinux() ? 'linux' : isMacOsX() ? 'macos' : 'windows'
+    }
+    compression = Compression.GZIP
+    archiveExtension = 'tar.gz'
+    into("mapgrow-${project.version}") {
+        from('src/main/packaging/mapgrow.sh') {
+            rename { 'mapgrow' }
+            filePermissions { unix('0755') }
+        }
+        into('runtime') {
+            from(layout.buildDirectory.dir('image')) {
+                exclude 'bin/mapgrow.bat'
+                exclude 'bin/keytool'
+            }
+            filesMatching('bin/*') {
+                permissions { unix('0755') }
+            }
+        }
+    }
+}
+
+// Windows: ZIP with native .exe launcher from jpackage app image
+tasks.register('packageZip', Zip) {
+    mustRunAfter 'packageDist'
+    dependsOn 'jpackageImage'
+    description = 'Create a ZIP with native exe launcher (Windows)'
+    archiveBaseName = 'mapgrow'
+    archiveClassifier = 'windows'
+    into("mapgrow-${project.version}") {
+        from(layout.buildDirectory.dir('jpackage/MapGrow')) {
+            exclude '**/keytool.exe'
+        }
+    }
+}
+
 
 tasks.register('buildGeoJson', JavaExec) {
     description = 'Download country boundaries from geoBoundaries and build countries.geojson'
