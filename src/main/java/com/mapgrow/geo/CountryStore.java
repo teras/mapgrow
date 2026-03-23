@@ -14,21 +14,23 @@ import java.util.*;
 
 public class CountryStore {
 
-    // Must match the palette used by ComputeColors
-    private static final Color[] PALETTE = {
-            new Color(0, 91, 187),    // 0: Blue
-            new Color(206, 17, 38),   // 1: Red
-            new Color(0, 154, 68),    // 2: Green
-            new Color(255, 206, 0),   // 3: Yellow
-            new Color(255, 130, 0),   // 4: Orange
-            new Color(112, 48, 160),  // 5: Purple
-            new Color(0, 158, 150),   // 6: Teal
-            new Color(180, 130, 70),  // 7: Tan
-            new Color(220, 100, 150), // 8: Rose
-            new Color(100, 120, 180), // 9: Steel Blue
-            new Color(160, 180, 60),  // 10: Olive
-            new Color(170, 80, 80),   // 11: Brick Red
+    // Must match ComputeColors PALETTE: [family][shade]
+    private static final Color[][] PALETTE = {
+            // Blue: normal, dark
+            {new Color(30, 120, 220), new Color(0, 50, 130)},
+            // Red: normal, dark
+            {new Color(210, 40, 50), new Color(140, 0, 20)},
+            // Green: normal, dark
+            {new Color(30, 170, 80), new Color(0, 90, 40)},
+            // Yellow: normal, dark
+            {new Color(255, 210, 30), new Color(200, 160, 0)},
+            // Orange: normal, dark
+            {new Color(255, 140, 20), new Color(200, 90, 0)},
+            // Purple: normal, dark
+            {new Color(130, 60, 180), new Color(70, 20, 110)},
     };
+
+    private static final GeometryFactory GF = new GeometryFactory();
 
     private final List<CountryInfo> countries = new ArrayList<>();
     private final STRtree spatialIndex = new STRtree();
@@ -39,8 +41,7 @@ public class CountryStore {
     private final Map<String, CountryInfo> countryByIso = new HashMap<>();
 
     public void load() throws IOException {
-        Map<String, Integer> colorMap = loadColorMap();
-        GeometryFactory gf = new GeometryFactory();
+        Map<String, String> colorMap = loadColorMap();
 
         // Load country boundaries
         try (InputStream is = getClass().getResourceAsStream("/countries.geojson")) {
@@ -53,11 +54,10 @@ public class CountryStore {
                 JsonNode props = feature.get("properties");
                 String name = props.has("NAME") ? props.get("NAME").asText() : "Unknown";
                 String iso = props.has("ISO_A3") ? props.get("ISO_A3").asText() : "UNK";
-                Geometry geometry = parseGeometry(feature.get("geometry"), gf);
+                Geometry geometry = parseGeometry(feature.get("geometry"), GF);
                 if (geometry == null) continue;
 
-                int colorIdx = colorMap.getOrDefault(iso, index % PALETTE.length);
-                Color color = PALETTE[colorIdx % PALETTE.length];
+                Color color = getColor(iso, index, colorMap);
                 CountryInfo info = new CountryInfo(name, iso, geometry, color);
                 countries.add(info);
                 spatialIndex.insert(geometry.getEnvelopeInternal(), info);
@@ -68,10 +68,10 @@ public class CountryStore {
         }
 
         // Load EEZ+Land zones for fallback lookup
-        loadEezZones(gf);
+        loadEezZones();
     }
 
-    private void loadEezZones(GeometryFactory gf) throws IOException {
+    private void loadEezZones() throws IOException {
         try (InputStream is = getClass().getResourceAsStream("/eez_zones.geojson")) {
             if (is == null) return; // optional — falls back to getNearestCountry
             ObjectMapper mapper = new ObjectMapper();
@@ -79,7 +79,7 @@ public class CountryStore {
 
             for (JsonNode feature : features) {
                 String iso = feature.get("properties").get("ISO_A3").asText();
-                Geometry geometry = parseGeometry(feature.get("geometry"), gf);
+                Geometry geometry = parseGeometry(feature.get("geometry"), GF);
                 if (geometry == null || !geometry.isValid()) continue;
                 PreparedGeometry prepared = PreparedGeometryFactory.prepare(geometry);
                 ZoneEntry entry = new ZoneEntry(iso, prepared);
@@ -89,14 +89,29 @@ public class CountryStore {
         }
     }
 
-    private Map<String, Integer> loadColorMap() throws IOException {
-        Map<String, Integer> map = new HashMap<>();
+    private static Color getColor(String iso, int index, Map<String, String> colorMap) {
+        String val = colorMap.get(iso);
+        if (val != null && val.contains(".")) {
+            String[] parts = val.split("\\.");
+            int family = Integer.parseInt(parts[0]);
+            int shade = Integer.parseInt(parts[1]);
+            if (family < PALETTE.length && shade < PALETTE[family].length) {
+                return PALETTE[family][shade];
+            }
+        }
+        // Fallback: old format (single int) or missing
+        int flat = index % (PALETTE.length * PALETTE[0].length);
+        return PALETTE[flat / PALETTE[0].length][flat % PALETTE[0].length];
+    }
+
+    private Map<String, String> loadColorMap() throws IOException {
+        Map<String, String> map = new HashMap<>();
         try (InputStream is = getClass().getResourceAsStream("/country_colors.properties")) {
             if (is == null) return map;
             Properties props = new Properties();
             props.load(is);
             for (String key : props.stringPropertyNames()) {
-                map.put(key, Integer.parseInt(props.getProperty(key)));
+                map.put(key, props.getProperty(key));
             }
         }
         return map;
@@ -118,8 +133,7 @@ public class CountryStore {
      * First tries EEZ+Land zone (point-in-polygon), then falls back to nearest country.
      */
     public CountryInfo getNearestCountry(double lon, double lat) {
-        GeometryFactory gf = new GeometryFactory();
-        Point point = gf.createPoint(new Coordinate(lon, lat));
+        Point point = GF.createPoint(new Coordinate(lon, lat));
 
         // Try EEZ zone lookup first (point-in-polygon)
         CountryInfo zoneResult = findZoneCountry(point);
@@ -158,7 +172,7 @@ public class CountryStore {
         return null;
     }
 
-    private Geometry parseGeometry(JsonNode geomNode, GeometryFactory gf) {
+    private static Geometry parseGeometry(JsonNode geomNode, GeometryFactory gf) {
         String type = geomNode.get("type").asText();
         JsonNode coords = geomNode.get("coordinates");
         return switch (type) {
@@ -168,7 +182,7 @@ public class CountryStore {
         };
     }
 
-    private Polygon parsePolygon(JsonNode coords, GeometryFactory gf) {
+    private static Polygon parsePolygon(JsonNode coords, GeometryFactory gf) {
         LinearRing shell = parseRing(coords.get(0), gf);
         LinearRing[] holes = new LinearRing[coords.size() - 1];
         for (int i = 1; i < coords.size(); i++) {
@@ -177,7 +191,7 @@ public class CountryStore {
         return gf.createPolygon(shell, holes);
     }
 
-    private MultiPolygon parseMultiPolygon(JsonNode coords, GeometryFactory gf) {
+    private static MultiPolygon parseMultiPolygon(JsonNode coords, GeometryFactory gf) {
         Polygon[] polygons = new Polygon[coords.size()];
         for (int i = 0; i < coords.size(); i++) {
             polygons[i] = parsePolygon(coords.get(i), gf);
@@ -185,7 +199,7 @@ public class CountryStore {
         return gf.createMultiPolygon(polygons);
     }
 
-    private LinearRing parseRing(JsonNode ringCoords, GeometryFactory gf) {
+    private static LinearRing parseRing(JsonNode ringCoords, GeometryFactory gf) {
         Coordinate[] coordinates = new Coordinate[ringCoords.size()];
         for (int i = 0; i < ringCoords.size(); i++) {
             JsonNode point = ringCoords.get(i);

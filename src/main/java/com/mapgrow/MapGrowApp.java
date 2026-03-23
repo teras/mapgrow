@@ -19,7 +19,7 @@ public class MapGrowApp extends JFrame {
 
     public MapGrowApp() {
         super("MapGrow");
-        setDefaultCloseOperation(EXIT_ON_CLOSE);
+        setDefaultCloseOperation(DISPOSE_ON_CLOSE);
 
         countryStore = new CountryStore();
         mapPanel = new MapPanel();
@@ -37,6 +37,14 @@ public class MapGrowApp extends JFrame {
 
         setSize(1024, 768);
         setLocationRelativeTo(null);
+
+        addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override
+            public void windowClosed(java.awt.event.WindowEvent e) {
+                mapPanel.close();
+                System.exit(0);
+            }
+        });
 
         SwingWorker<Void, Void> loader = new SwingWorker<>() {
             @Override

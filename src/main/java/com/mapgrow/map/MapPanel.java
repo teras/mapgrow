@@ -17,8 +17,13 @@ import java.net.http.HttpResponse;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
-public class MapPanel extends JPanel {
+public class MapPanel extends JPanel implements AutoCloseable {
+
+    private static final Logger LOG = Logger.getLogger(MapPanel.class.getName());
 
     private static final int TILE_SIZE = 256;
     private static final int TILE_PIXELS = TILE_SIZE * TILE_SIZE;
@@ -66,7 +71,7 @@ public class MapPanel extends JPanel {
     private boolean interactionEnabled = true;
     private Runnable zoomChangeListener;
 
-    private volatile BufferedImage expansionOverlay;
+    private final AtomicReference<BufferedImage> expansionOverlay = new AtomicReference<>();
 
     public MapPanel() {
         setBackground(BG_MAP);
@@ -131,12 +136,12 @@ public class MapPanel extends JPanel {
     }
 
     public void setExpansionOverlay(BufferedImage image) {
-        this.expansionOverlay = image;
+        this.expansionOverlay.set(image);
         repaint();
     }
 
     public void clearExpansionOverlay() {
-        this.expansionOverlay = null;
+        this.expansionOverlay.set(null);
         repaint();
     }
 
@@ -155,8 +160,13 @@ public class MapPanel extends JPanel {
         int h = getHeight();
         double originX = centerX - w / 2.0;
         double originY = centerY - h / 2.0;
-        int maxTile = 1 << zoom;
 
+        paintTiles(g2, w, h, originX, originY);
+        paintExpansionOverlay(g2, w, h);
+    }
+
+    private void paintTiles(Graphics2D g2, int w, int h, double originX, double originY) {
+        int maxTile = 1 << zoom;
         int tileXStart = (int) Math.floor(originX / TILE_SIZE);
         int tileYStart = (int) Math.floor(originY / TILE_SIZE);
         int tileXEnd = (int) Math.floor((originX + w) / TILE_SIZE);
@@ -164,6 +174,7 @@ public class MapPanel extends JPanel {
 
         Composite originalComposite = g2.getComposite();
         boolean showOsm = viewMode == ViewMode.MAP_WITH_OVERLAY;
+        boolean hasExpansion = expansionOverlay.get() != null;
 
         for (int ty = tileYStart; ty <= tileYEnd; ty++) {
             for (int tx = tileXStart; tx <= tileXEnd; tx++) {
@@ -183,7 +194,7 @@ public class MapPanel extends JPanel {
                     }
                 }
 
-                if (expansionOverlay == null) {
+                if (!hasExpansion) {
                     TileData td = getTileData(zoom, wrappedTx, ty);
                     if (td != null) {
                         BufferedImage img = switch (viewMode) {
@@ -202,15 +213,16 @@ public class MapPanel extends JPanel {
                 }
             }
         }
+    }
 
-        // Expansion overlay (during/after processing)
-        BufferedImage expOverlay = this.expansionOverlay;
+    private void paintExpansionOverlay(Graphics2D g2, int w, int h) {
+        BufferedImage expOverlay = this.expansionOverlay.get();
         if (expOverlay != null) {
+            Composite originalComposite = g2.getComposite();
             g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, OVERLAY_ALPHA));
             g2.drawImage(expOverlay, 0, 0, w, h, null);
             g2.setComposite(originalComposite);
         }
-
     }
 
     private BufferedImage getOsmTile(int z, int x, int y) {
@@ -238,74 +250,97 @@ public class MapPanel extends JPanel {
 
         tileLoader.submit(() -> {
             if (tileDataCache.containsKey(key)) return;
-
-            BufferedImage cartoTile = fetchTile(String.format(CARTO_URL, z, x, y));
-            if (cartoTile == null) return;
-
-            // Convert to ARGB and get backing array for fast pixel access
-            BufferedImage cartoArgb = new BufferedImage(TILE_SIZE, TILE_SIZE, BufferedImage.TYPE_INT_ARGB);
-            Graphics2D gTemp = cartoArgb.createGraphics();
-            gTemp.drawImage(cartoTile, 0, 0, null);
-            gTemp.dispose();
-            int[] cartoPixels = ((DataBufferInt) cartoArgb.getRaster().getDataBuffer()).getData();
-
-            // Classify land/water: water must be close to water color AND blue-tinted
-            boolean[] isLand = new boolean[TILE_PIXELS];
-            for (int i = 0; i < TILE_PIXELS; i++) {
-                int rgb = cartoPixels[i];
-                int r = (rgb >> 16) & 0xFF;
-                int g = (rgb >> 8) & 0xFF;
-                int b = rgb & 0xFF;
-                int dr = r - WATER_R, dg = g - WATER_G, db = b - WATER_B;
-                int distSq = dr * dr + dg * dg + db * db;
-                isLand[i] = distSq > WATER_DIST_THRESHOLD || b <= r + BLUE_TINT_MIN;
+            TileData td = buildTileData(z, x, y);
+            if (td != null) {
+                tileDataCache.put(key, td);
+                SwingUtilities.invokeLater(this::repaint);
             }
-
-            // Rasterize countries
-            double tileMinLon = tileToLon(x, z);
-            double tileMaxLon = tileToLon(x + 1, z);
-            double tileMinLat = tileToLat(y + 1, z);
-            double tileMaxLat = tileToLat(y, z);
-
-            var countries = countryStore.getCountriesIn(tileMinLon, tileMinLat, tileMaxLon, tileMaxLat);
-            int[] countryPixels = rasterizer.rasterize(
-                    tileMinLon, tileMinLat, tileMaxLon, tileMaxLat,
-                    TILE_SIZE, TILE_SIZE, countries);
-
-            // Land mask (black land on transparent)
-            BufferedImage landMask = new BufferedImage(TILE_SIZE, TILE_SIZE, BufferedImage.TYPE_INT_ARGB);
-            int[] landMaskPixels = ((DataBufferInt) landMask.getRaster().getDataBuffer()).getData();
-            for (int i = 0; i < TILE_PIXELS; i++) {
-                if (isLand[i]) landMaskPixels[i] = 0xFF000000;
-            }
-
-            // Natural Earth (raw country polygons, no CartoDB masking)
-            BufferedImage naturalEarth = new BufferedImage(TILE_SIZE, TILE_SIZE, BufferedImage.TYPE_INT_ARGB);
-            int[] nePixels = ((DataBufferInt) naturalEarth.getRaster().getDataBuffer()).getData();
-            System.arraycopy(countryPixels, 0, nePixels, 0, TILE_PIXELS);
-
-            // Overlay (CartoDB land + country colors + fill)
-            BufferedImage overlay = new BufferedImage(TILE_SIZE, TILE_SIZE, BufferedImage.TYPE_INT_ARGB);
-            int[] overlayData = ((DataBufferInt) overlay.getRaster().getDataBuffer()).getData();
-
-            int uncoloredLand = 0;
-            for (int i = 0; i < TILE_PIXELS; i++) {
-                if (isLand[i] && countryPixels[i] != 0) {
-                    overlayData[i] = countryPixels[i];
-                } else if (isLand[i]) {
-                    uncoloredLand++;
-                }
-            }
-
-            if (uncoloredLand > 0) {
-                fillUncoloredLand(overlayData, isLand, TILE_SIZE, TILE_SIZE);
-                fillIsolatedLand(overlayData, isLand, tileMinLon, tileMaxLon, tileMinLat, tileMaxLat);
-            }
-
-            tileDataCache.put(key, new TileData(overlay, landMask, naturalEarth));
-            SwingUtilities.invokeLater(this::repaint);
         });
         return null;
+    }
+
+    private TileData buildTileData(int z, int x, int y) {
+        BufferedImage cartoTile = fetchTile(String.format(CARTO_URL, z, x, y));
+        if (cartoTile == null) return null;
+
+        int[] cartoPixels = toArgbPixels(cartoTile);
+        boolean[] isLand = classifyLandWater(cartoPixels);
+
+        double tileMinLon = tileToLon(x, z);
+        double tileMaxLon = tileToLon(x + 1, z);
+        double tileMinLat = tileToLat(y + 1, z);
+        double tileMaxLat = tileToLat(y, z);
+
+        var countries = countryStore.getCountriesIn(tileMinLon, tileMinLat, tileMaxLon, tileMaxLat);
+        int[] countryPixels = rasterizer.rasterize(
+                tileMinLon, tileMinLat, tileMaxLon, tileMaxLat,
+                TILE_SIZE, TILE_SIZE, countries);
+
+        BufferedImage landMask = buildLandMask(isLand);
+        BufferedImage naturalEarth = buildNaturalEarth(countryPixels);
+        BufferedImage overlay = buildOverlay(countryPixels, isLand, tileMinLon, tileMaxLon, tileMinLat, tileMaxLat);
+
+        return new TileData(overlay, landMask, naturalEarth);
+    }
+
+    private static int[] toArgbPixels(BufferedImage source) {
+        BufferedImage argb = new BufferedImage(TILE_SIZE, TILE_SIZE, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = argb.createGraphics();
+        g.drawImage(source, 0, 0, null);
+        g.dispose();
+        return ((DataBufferInt) argb.getRaster().getDataBuffer()).getData();
+    }
+
+    private static boolean[] classifyLandWater(int[] cartoPixels) {
+        boolean[] isLand = new boolean[TILE_PIXELS];
+        for (int i = 0; i < TILE_PIXELS; i++) {
+            int rgb = cartoPixels[i];
+            int r = (rgb >> 16) & 0xFF;
+            int g = (rgb >> 8) & 0xFF;
+            int b = rgb & 0xFF;
+            int dr = r - WATER_R, dg = g - WATER_G, db = b - WATER_B;
+            int distSq = dr * dr + dg * dg + db * db;
+            isLand[i] = distSq > WATER_DIST_THRESHOLD || b <= r + BLUE_TINT_MIN;
+        }
+        return isLand;
+    }
+
+    private static BufferedImage buildLandMask(boolean[] isLand) {
+        BufferedImage landMask = new BufferedImage(TILE_SIZE, TILE_SIZE, BufferedImage.TYPE_INT_ARGB);
+        int[] pixels = ((DataBufferInt) landMask.getRaster().getDataBuffer()).getData();
+        for (int i = 0; i < TILE_PIXELS; i++) {
+            if (isLand[i]) pixels[i] = 0xFF000000;
+        }
+        return landMask;
+    }
+
+    private static BufferedImage buildNaturalEarth(int[] countryPixels) {
+        BufferedImage naturalEarth = new BufferedImage(TILE_SIZE, TILE_SIZE, BufferedImage.TYPE_INT_ARGB);
+        int[] pixels = ((DataBufferInt) naturalEarth.getRaster().getDataBuffer()).getData();
+        System.arraycopy(countryPixels, 0, pixels, 0, TILE_PIXELS);
+        return naturalEarth;
+    }
+
+    private BufferedImage buildOverlay(int[] countryPixels, boolean[] isLand,
+                                        double minLon, double maxLon, double minLat, double maxLat) {
+        BufferedImage overlay = new BufferedImage(TILE_SIZE, TILE_SIZE, BufferedImage.TYPE_INT_ARGB);
+        int[] overlayData = ((DataBufferInt) overlay.getRaster().getDataBuffer()).getData();
+
+        int uncoloredLand = 0;
+        for (int i = 0; i < TILE_PIXELS; i++) {
+            if (isLand[i] && countryPixels[i] != 0) {
+                overlayData[i] = countryPixels[i];
+            } else if (isLand[i]) {
+                uncoloredLand++;
+            }
+        }
+
+        if (uncoloredLand > 0) {
+            fillUncoloredLand(overlayData, isLand, TILE_SIZE, TILE_SIZE);
+            fillIsolatedLand(overlayData, isLand, minLon, maxLon, minLat, maxLat);
+        }
+
+        return overlay;
     }
 
     /**
@@ -352,7 +387,10 @@ public class MapPanel extends JPanel {
             }
 
             int nextSize = 0;
-            java.util.Arrays.fill(inFrontier, false);
+            // Selective clearing: only reset indices that were in the frontier
+            for (int f = 0; f < frontierSize; f++) {
+                inFrontier[curFrontier[f]] = false;
+            }
             for (int f = 0; f < frontierSize; f++) {
                 int idx = curFrontier[f];
                 int x = idx % w, y = idx / w;
@@ -426,8 +464,9 @@ public class MapPanel extends JPanel {
             if (response.statusCode() == 200) {
                 return ImageIO.read(response.body());
             }
+            LOG.warning("Tile fetch failed: HTTP " + response.statusCode() + " for " + url);
         } catch (Exception e) {
-            // Silently ignore network errors
+            LOG.log(Level.WARNING, "Tile fetch error for " + url, e);
         }
         return null;
     }
@@ -475,6 +514,11 @@ public class MapPanel extends JPanel {
             }
         }
         return pixels;
+    }
+
+    @Override
+    public void close() {
+        tileLoader.shutdownNow();
     }
 
     private static double tileToLon(int x, int z) {

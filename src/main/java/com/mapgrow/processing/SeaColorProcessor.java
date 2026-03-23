@@ -2,7 +2,6 @@ package com.mapgrow.processing;
 
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
-import java.util.Arrays;
 import java.util.function.Consumer;
 
 public class SeaColorProcessor {
@@ -77,7 +76,10 @@ public class SeaColorProcessor {
                 }
             }
 
-            Arrays.fill(inFrontier, false);
+            // Selective clearing: only reset indices that were in the frontier
+            for (int f = 0; f < frontierSize; f++) {
+                inFrontier[frontier[f]] = false;
+            }
             int nextSize = 0;
 
             for (int p = 0; p < pendingSize; p++) {
@@ -113,25 +115,29 @@ public class SeaColorProcessor {
     }
 
     private static int computeColor(int[] pixels, int x, int y, int w, int h) {
-        int totalR = 0, totalG = 0, totalB = 0, totalWeight = 0;
+        // Weighted voting: each neighbor color accumulates weight.
+        // The color with most total weight wins (no blending/mixing).
+        int c1 = 0, w1 = 0; // best color + weight
+        int c2 = 0, w2 = 0; // second best
         for (int n = 0; n < 8; n++) {
             int nx = x + DX[n], ny = y + DY[n];
             if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
             int c = pixels[ny * w + nx];
             if (c == 0) continue;
             int wt = WEIGHTS[n];
-            totalR += ((c >> 16) & 0xFF) * wt;
-            totalG += ((c >> 8) & 0xFF) * wt;
-            totalB += (c & 0xFF) * wt;
-            totalWeight += wt;
+            if (c == c1) {
+                w1 += wt;
+            } else if (c == c2) {
+                w2 += wt;
+                if (w2 > w1) { int tc = c1; c1 = c2; c2 = tc; int tw = w1; w1 = w2; w2 = tw; }
+            } else if (c1 == 0) {
+                c1 = c; w1 = wt;
+            } else if (c2 == 0 || wt > w2) {
+                c2 = c; w2 = wt;
+                if (w2 > w1) { int tc = c1; c1 = c2; c2 = tc; int tw = w1; w1 = w2; w2 = tw; }
+            }
         }
-        if (totalWeight > 0) {
-            return (0xFF << 24)
-                    | ((totalR / totalWeight) << 16)
-                    | ((totalG / totalWeight) << 8)
-                    | (totalB / totalWeight);
-        }
-        return 0;
+        return c1;
     }
 
     private static boolean hasNeighbor(int[] pixels, int x, int y, int w, int h) {
